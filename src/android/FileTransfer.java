@@ -838,6 +838,7 @@ public class FileTransfer extends CordovaPlugin {
                         // connect to server
                         // Open a HTTP connection to the URL based on protocol
                         connection = resourceApi.createHttpConnection(sourceUri);
+                        connection.setInstanceFollowRedirects(false);
                         if (useHttps && trustEveryone) {
                             // Setup the HTTPS connection class to trust everyone
                             HttpsURLConnection https = (HttpsURLConnection)connection;
