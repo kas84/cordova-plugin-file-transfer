@@ -759,3 +759,175 @@ public class FileTransfer extends CordovaPlugin {
                         // Open a HTTP connection to the URL based on protocol
                         connection = resourceApi.createHttpConnection(sourceUri);
                         connection.setInstanceFollowRedirects(false);
+                        connection.setRequestMethod("GET");
+
+                        // TODO: Make OkHttp use this CookieManager by default.
+                        String cookie = getCookies(sourceUri.toString());
+
+                        if(cookie != null)
+                        {
+                            connection.setRequestProperty("cookie", cookie);
+                        }
+
+                        // This must be explicitly set for gzip progress tracking to work.
+                        connection.setRequestProperty("Accept-Encoding", "gzip");
+
+                        // Handle the other headers
+                        if (headers != null) {
+                            addHeadersToRequest(connection, headers);
+                        }
+
+                        connection.connect();
+                        if (connection.getResponseCode() == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                            cached = true;
+                            connection.disconnect();
+                            LOG.d(LOG_TAG, "Resource not modified: " + source);
+                            JSONObject error = createFileTransferError(NOT_MODIFIED_ERR, source, target, connection, null);
+                            result = new PluginResult(PluginResult.Status.ERROR, error);
+                        } else {
+                            if (connection.getContentEncoding() == null || connection.getContentEncoding().equalsIgnoreCase("gzip")) {
+                                // Only trust content-length header if we understand
+                                // the encoding -- identity or gzip
+                                if (connection.getContentLength() != -1) {
+                                    progress.setLengthComputable(true);
+                                    progress.setTotal(connection.getContentLength());
+                                }
+                            }
+                            inputStream = getInputStream(connection);
+                        }
+                    }
+
+                    if (!cached) {
+                        try {
+                            synchronized (context) {
+                                if (context.aborted) {
+                                    return;
+                                }
+                                context.connection = connection;
+                            }
+
+                            // write bytes to file
+                            byte[] buffer = new byte[MAX_BUFFER_SIZE];
+                            int bytesRead = 0;
+                            outputStream = resourceApi.openOutputStream(targetUri);
+                            while ((bytesRead = inputStream.read(buffer)) > 0) {
+                                outputStream.write(buffer, 0, bytesRead);
+                                // Send a progress event.
+                                progress.setLoaded(inputStream.getTotalRawBytesRead());
+                                PluginResult progressResult = new PluginResult(PluginResult.Status.OK, progress.toJSONObject());
+                                progressResult.setKeepCallback(true);
+                                context.sendPluginResult(progressResult);
+                            }
+                        } finally {
+                            synchronized (context) {
+                                context.connection = null;
+                            }
+                            safeClose(inputStream);
+                            safeClose(outputStream);
+                        }
+
+                        LOG.d(LOG_TAG, "Saved file: " + target);
+
+
+                        // create FileEntry object
+                        Class webViewClass = webView.getClass();
+                        PluginManager pm = null;
+                        try {
+                            Method gpm = webViewClass.getMethod("getPluginManager");
+                            pm = (PluginManager) gpm.invoke(webView);
+                        } catch (NoSuchMethodException e) {
+                        } catch (IllegalAccessException e) {
+                        } catch (InvocationTargetException e) {
+                        }
+                        if (pm == null) {
+                            try {
+                                Field pmf = webViewClass.getField("pluginManager");
+                                pm = (PluginManager)pmf.get(webView);
+                            } catch (NoSuchFieldException e) {
+                            } catch (IllegalAccessException e) {
+                            }
+                        }
+                        file = resourceApi.mapUriToFile(targetUri);
+                        context.targetFile = file;
+                        FileUtils filePlugin = (FileUtils) pm.getPlugin("File");
+                        if (filePlugin != null) {
+                            JSONObject fileEntry = filePlugin.getEntryForFile(file);
+                            if (fileEntry != null) {
+                                result = new PluginResult(PluginResult.Status.OK, fileEntry);
+                            } else {
+                                JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, connection, null);
+                                LOG.e(LOG_TAG, "File plugin cannot represent download path");
+                                result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
+                            }
+                        } else {
+                            LOG.e(LOG_TAG, "File plugin not found; cannot save downloaded file");
+                            result = new PluginResult(PluginResult.Status.ERROR, "File plugin not found; cannot save downloaded file");
+                        }
+                    }
+                } catch (FileNotFoundException e) {
+                    JSONObject error = createFileTransferError(FILE_NOT_FOUND_ERR, source, target, connection, e);
+                    LOG.e(LOG_TAG, error.toString(), e);
+                    result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
+                } catch (IOException e) {
+                    JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, connection, e);
+                    LOG.e(LOG_TAG, error.toString(), e);
+                    result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
+                } catch (JSONException e) {
+                    LOG.e(LOG_TAG, e.getMessage(), e);
+                    result = new PluginResult(PluginResult.Status.JSON_EXCEPTION);
+                } catch (Throwable e) {
+                    JSONObject error = createFileTransferError(CONNECTION_ERR, source, target, connection, e);
+                    LOG.e(LOG_TAG, error.toString(), e);
+                    result = new PluginResult(PluginResult.Status.IO_EXCEPTION, error);
+                } finally {
+                    synchronized (activeRequests) {
+                        activeRequests.remove(objectId);
+                    }
+
+                    if (result == null) {
+                        result = new PluginResult(PluginResult.Status.ERROR, createFileTransferError(CONNECTION_ERR, source, target, connection, null));
+                    }
+                    // Remove incomplete download.
+                    if (!cached && result.getStatus() != PluginResult.Status.OK.ordinal() && file != null) {
+                        file.delete();
+                    }
+                    context.sendPluginResult(result);
+                }
+            }
+        });
+    }
+
+    /**
+     * Abort an ongoing upload or download.
+     */
+    private void abort(String objectId) {
+        final RequestContext context;
+        synchronized (activeRequests) {
+            context = activeRequests.remove(objectId);
+        }
+        if (context != null) {
+            // Closing the streams can block, so execute on a background thread.
+            cordova.getThreadPool().execute(new Runnable() {
+                public void run() {
+                    synchronized (context) {
+                        File file = context.targetFile;
+                        if (file != null) {
+                            file.delete();
+                        }
+                        // Trigger the abort callback immediately to minimize latency between it and abort() being called.
+                        JSONObject error = createFileTransferError(ABORTED_ERR, context.source, context.target, null, -1, null);
+                        context.sendPluginResult(new PluginResult(PluginResult.Status.ERROR, error));
+                        context.aborted = true;
+                        if (context.connection != null) {
+                            try {
+                                context.connection.disconnect();
+                            } catch (Exception e) {
+                                LOG.e(LOG_TAG, "CB-8431 Catch workaround for fatal exception", e);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
